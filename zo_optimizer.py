@@ -9,7 +9,7 @@ class ZeroOrderOptimizer:
         model: nn.Module,
         lr: float = 1e-4,
         eps: float = 5e-4,
-        K: int = 32,
+        K: int = 16,
         reg_lambda: float = 0.1,
     ) -> None:
         self.model = model
