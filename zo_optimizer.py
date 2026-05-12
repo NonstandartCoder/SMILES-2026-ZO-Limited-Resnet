@@ -1,130 +1,145 @@
-"""
-zo_optimizer.py — Zero-order optimizer skeleton (student-implemented).
-
-Students: Implement your gradient-free optimization logic inside
-``ZeroOrderOptimizer``. The skeleton uses a 2-point central-difference
-estimator as a starting point — you are expected to replace or extend it.
-
-Key design points
------------------
-* **Layer selection** is entirely your responsibility. Set ``self.layer_names``
-  to the list of parameter names you want to optimize. You can change this list
-  at any time — even between ``.step()`` calls — to implement curriculum or
-  progressive-layer strategies.
-* **Compute budget** is enforced by ``validate.py``: ``.step()`` is called
-  exactly ``n_batches`` times. Each call may invoke the model as many times as
-  your estimator requires, but be mindful that more evaluations per step leave
-  fewer steps in the total budget.
-* **No gradients** are computed anywhere in this file. All updates must be
-  derived from scalar loss values obtained by calling ``loss_fn()``.
-"""
-
-from __future__ import annotations
-
-import math
 from typing import Callable
-
 import torch
 import torch.nn as nn
 
 
 class ZeroOrderOptimizer:
     def __init__(
-            self,
-            model: nn.Module,
-            lr: float = 1e-2,  # Adam usually needs a higher LR for ZO
-            eps: float = 1e-3,
-            perturbation_mode: str = "gaussian",
+        self,
+        model: nn.Module,
+        lr: float = 1e-4,
+        eps: float = 5e-4,
+        K: int = 32,
+        reg_lambda: float = 0.1,
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
-        self.perturbation_mode = perturbation_mode
+        self.K = K
+        self.reg_lambda = reg_lambda
 
-        # We start by tuning only the final layer (the head)
+        self.expand_at_step = 32
+        self.has_expanded = False
+
         self.layer_names: list[str] = ["fc.weight", "fc.bias"]
 
-        # Adam state
-        self.m = {}  # First moment
-        self.v = {}  # Second moment
-        self.t = 0  # Time step
+        self.all_layer_names = self.layer_names + self._get_bn_names()
+
+        self.m = {}
+        self.v = {}
+        self.t = 0
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.adam_eps = 1e-8
+
+        self.initial_params = {}
+        self._capture_initial(self.layer_names)
+
+    def _get_bn_names(self) -> list[str]:
+        bn_names = []
+        for name, param in self.model.named_parameters():
+            if ("bn" in name or "downsample.1" in name) and (
+                name.endswith(".weight") or name.endswith(".bias")
+            ):
+                bn_names.append(name)
+        return bn_names
+
+    def _capture_initial(self, layer_names: list[str]):
+        named = dict(self.model.named_parameters())
+        for n in layer_names:
+            if n not in self.initial_params:
+                self.initial_params[n] = named[n].data.clone()
 
     def _active_params(self) -> dict[str, nn.Parameter]:
         named = dict(self.model.named_parameters())
         return {n: named[n] for n in self.layer_names}
 
     def _estimate_grad(
-            self,
-            loss_fn: Callable[[], float],
-            params: dict[str, nn.Parameter],
+        self,
+        loss_fn: Callable[[], float],
+        params: dict[str, nn.Parameter],
     ) -> dict[str, torch.Tensor]:
-        grads: dict[str, torch.Tensor] = {}
+        grads: dict[str, torch.Tensor] = {
+            name: torch.zeros_like(p) for name, p in params.items()
+        }
 
-        # SPSA: Sample ONE random perturbation for ALL parameters
-        # This is the key to efficiency!
-        u_dict = {}
-        for name, param in params.items():
-            if self.perturbation_mode == "gaussian":
+        for _ in range(self.K):
+            u_dict = {}
+            for name, param in params.items():
                 u = torch.randn_like(param)
-            else:
-                u = torch.bernoulli(torch.full_like(param, 0.5)) * 2 - 1
-            u_dict[name] = u
+                u = u / (u.norm() / u.numel() ** 0.5)
+                u_dict[name] = u
 
-        with torch.no_grad():
-            # Apply perturbation: theta + eps * u
-            for name, param in params.items():
-                param.data.add_(u_dict[name], alpha=self.eps)
-            f_plus = loss_fn()
+            with torch.no_grad():
+                for name, param in params.items():
+                    param.data.add_(u_dict[name], alpha=self.eps)
+                f_plus = loss_fn()
 
-            # Apply perturbation: theta - eps * u (subtract 2*eps)
-            for name, param in params.items():
-                param.data.sub_(u_dict[name], alpha=2.0 * self.eps)
-            f_minus = loss_fn()
+                for name, param in params.items():
+                    param.data.sub_(u_dict[name], alpha=2.0 * self.eps)
+                f_minus = loss_fn()
 
-            # Restore original: theta
-            for name, param in params.items():
-                param.data.add_(u_dict[name], alpha=self.eps)
+                for name, param in params.items():
+                    param.data.add_(u_dict[name], alpha=self.eps)
 
-            # Gradient Estimate: (f+ - f-) / (2 * eps) * u
-            # Note: For SPSA, we multiply by the direction vector
-            diff = (f_plus - f_minus) / (2.0 * self.eps)
-            for name in params:
-                grads[name] = diff * u_dict[name]
+                diff = (f_plus - f_minus) / (2.0 * self.eps)
+                for name in params:
+                    grads[name] += diff * u_dict[name]
 
+        for name in grads:
+            grads[name] /= self.K
         return grads
 
     def _update_params(
-            self,
-            params: dict[str, nn.Parameter],
-            grads: dict[str, torch.Tensor],
+        self,
+        params: dict[str, nn.Parameter],
+        grads: dict[str, torch.Tensor],
     ) -> None:
         self.t += 1
         with torch.no_grad():
             for name, param in params.items():
-                # Initialize Adam states if not present
                 if name not in self.m:
                     self.m[name] = torch.zeros_like(param)
                     self.v[name] = torch.zeros_like(param)
 
-                # Update moments
-                self.m[name] = self.beta1 * self.m[name] + (1 - self.beta1) * grads[name]
-                self.v[name] = self.beta2 * self.v[name] + (1 - self.beta2) * (grads[name] ** 2)
+                self.m[name] = (
+                    self.beta1 * self.m[name] + (1 - self.beta1) * grads[name]
+                )
+                self.v[name] = (
+                    self.beta2 * self.v[name]
+                    + (1 - self.beta2) * (grads[name] ** 2)
+                )
 
-                # Bias correction
                 m_hat = self.m[name] / (1 - self.beta1 ** self.t)
                 v_hat = self.v[name] / (1 - self.beta2 ** self.t)
 
-                # Apply update
-                param.data.sub_(self.lr * m_hat / (torch.sqrt(v_hat) + self.adam_eps))
+                param.data.sub_(
+                    self.lr * m_hat / (torch.sqrt(v_hat) + self.adam_eps)
+                )
 
     def step(self, loss_fn: Callable[[], float]) -> float:
-        params = self._active_params()
-        with torch.no_grad():
-            loss_before = loss_fn()
+        if (
+            not self.has_expanded
+            and self.expand_at_step is not None
+            and self.t >= self.expand_at_step
+        ):
+            self.layer_names = self.all_layer_names
+            self._capture_initial(self.all_layer_names)
+            self.has_expanded = True
 
-        grads = self._estimate_grad(loss_fn, params)
+        params = self._active_params()
+
+        def reg_loss_fn():
+            ce = loss_fn()
+            reg = 0.0
+            for name, p in params.items():
+                reg += torch.sum((p - self.initial_params[name]) ** 2)
+            return ce + self.reg_lambda * reg.item()
+
+        with torch.no_grad():
+            loss_before = reg_loss_fn()
+
+        grads = self._estimate_grad(reg_loss_fn, params)
         self._update_params(params, grads)
+
         return float(loss_before)

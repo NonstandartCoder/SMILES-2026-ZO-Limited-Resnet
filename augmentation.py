@@ -1,28 +1,18 @@
-"""
-augmentation.py — Data augmentation pipeline for CIFAR100 (student-modified).
-
-Students: Extend the *training* transform pipeline to improve generalization.
-The validation pipeline is fixed — do not modify it.
-
-CIFAR100 images are 32×32. Both pipelines resize to 224×224 to match the
-input expected by the pretrained ResNet18 backbone.
-"""
-
 import torchvision.transforms as T
 
 _CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 _CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
+
 def get_transforms(train: bool) -> T.Compose:
     if train:
         return T.Compose([
-            T.Resize(224),
+            T.RandomResizedCrop(224, scale=(0.8, 1.0)),
             T.RandomHorizontalFlip(),
-            T.RandomRotation(15),
-            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.ColorJitter(0.4, 0.4, 0.4, 0.1),
             T.ToTensor(),
             T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
-            T.RandomErasing(p=0.1, scale=(0.02, 0.1)),
+            T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
         ])
     else:
         return T.Compose([
